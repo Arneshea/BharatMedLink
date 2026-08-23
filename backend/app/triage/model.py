@@ -1,8 +1,8 @@
 """
-Stage-1 medical-triage model loader — google/medgemma-4b-it
+Stage-1 medical-triage model loader — google/medgemma-1.5-4b-it
 (step 4.4 / section 41S).
 
-MedGemma 4B is a generative, multimodal (text + image) instruction-
+MedGemma is a generative, multimodal (text + image) instruction-
 tuned model, not a text-classification model with a fixed label head.
 That changes how "inference" works here compared to a classifier:
 
@@ -12,17 +12,14 @@ That changes how "inference" works here compared to a classifier:
     its response. If the response doesn't contain a recognized token,
     we treat it as ASSESSMENT_UNAVAILABLE (step 4.5) rather than
     guessing.
-  - `model_scores_optional` is therefore always None for this model —
-    it never fabricates a confidence figure the model didn't actually
-    produce.
-  - Because MedGemma is multimodal, this same loaded model/processor is
-    reused by app/triage/document_parser.py to read a scanned referral
-    letter (image input). The model is loaded exactly once at process
-    startup either way (never per request).
+  - `model_scores_optional` is therefore always None for this model.
+  - Because MedGemma is multimodal, this same model is reused by
+    app/triage/document_parser.py to read a scanned referral letter.
 
-This is still a broad pre-triage signal, not a diagnostic system
-(section 0.5) — the strict system prompt below asks only for an
-urgency bucket, never a diagnosis.
+API-only mode (HF_USE_HOSTED_INFERENCE_API=true): calls a dedicated HF
+Inference Endpoint's OpenAI-compatible Messages API. MedGemma is NOT
+on HF's free shared serverless API, so HF_INFERENCE_ENDPOINT_URL must
+be set — see config.py.
 """
 
 import re
@@ -58,37 +55,31 @@ TRIAGE_SYSTEM_PROMPT = (
 
 @dataclass
 class TriageResult:
-    label: str  # one of TRIAGE_LABELS, or "ASSESSMENT_UNAVAILABLE"
-    scores: Optional[dict] = None  # always None for MedGemma — see module docstring
+    label: str
+    scores: Optional[dict] = None
     model_name: str = ""
     model_version: str = ""
 
 
 def is_ready() -> bool:
-    """Used by GET /ready — never report ready if the model isn't usable."""
     cfg = get_config()
     if cfg.HF_USE_HOSTED_INFERENCE_API:
-        return bool(cfg.HF_API_TOKEN)
+        return bool(cfg.HF_API_TOKEN) and bool(cfg.HF_INFERENCE_ENDPOINT_URL)
     return _model_state["loaded"]
 
 
 def warm_up():
-    """
-    Call once at process startup (see app/__init__.py). Loads the
-    pinned model/revision into memory so the first real request isn't
-    also paying model-load latency.
-
-    google/medgemma-4b-it is a GATED model on Hugging Face: your
-    HF_API_TOKEN's account must have accepted Google's license on the
-    model page, or this will fail with a 401/403 — that failure is
-    caught and surfaced through get_load_metrics()["load_error"], not
-    raised, so the rest of the app can still start.
-    """
     cfg = get_config()
     if cfg.HF_USE_HOSTED_INFERENCE_API:
-        # Nothing to preload locally; readiness just checks the token exists.
         _model_state["model_name"] = cfg.HF_TRIAGE_MODEL_NAME
         _model_state["model_revision"] = cfg.HF_TRIAGE_MODEL_REVISION
+        if not cfg.HF_INFERENCE_ENDPOINT_URL:
+            _model_state["load_error"] = (
+                "HF_USE_HOSTED_INFERENCE_API=true but HF_INFERENCE_ENDPOINT_URL "
+                "is not set. MedGemma is not on HF's free shared serverless "
+                "API — deploy a dedicated Inference Endpoint at "
+                "https://ui.endpoints.huggingface.co/ and set its URL."
+            )
         return
 
     start = time.time()
@@ -106,13 +97,12 @@ def warm_up():
         _model_state["model_name"] = cfg.HF_TRIAGE_MODEL_NAME
         _model_state["model_revision"] = cfg.HF_TRIAGE_MODEL_REVISION
         _model_state["load_seconds"] = time.time() - start
-    except Exception as exc:  # noqa: BLE001 - deliberate: log and stay not-ready
+    except Exception as exc:
         _model_state["loaded"] = False
         _model_state["load_error"] = str(exc)
 
 
 def get_load_metrics() -> dict:
-    """Section 41S: measure load time / memory during development."""
     return {
         "loaded": _model_state["loaded"],
         "load_seconds": _model_state.get("load_seconds"),
@@ -130,38 +120,51 @@ def _parse_label(generated_text: str) -> Optional[str]:
     return None
 
 
+def _to_openai_content(content_items: list) -> list:
+    converted = []
+    for item in content_items:
+        if item["type"] == "image":
+            converted.append({"type": "image_url", "image_url": {"url": item["image"]}})
+        else:
+            converted.append(item)
+    return converted
+
+
 def _run_chat(messages: list) -> str:
-    """Shared chat-completion call used by both triage and document parsing."""
     cfg = get_config()
     if cfg.HF_USE_HOSTED_INFERENCE_API:
-        url = f"https://api-inference.huggingface.co/models/{cfg.HF_TRIAGE_MODEL_NAME}"
-        headers = {"Authorization": f"Bearer {cfg.HF_API_TOKEN}"}
-        resp = requests.post(url, headers=headers, json={"inputs": messages}, timeout=30)
+        if not cfg.HF_INFERENCE_ENDPOINT_URL:
+            raise RuntimeError(
+                "HF_INFERENCE_ENDPOINT_URL is not set. Deploy a dedicated "
+                "HF Inference Endpoint and set its URL."
+            )
+        url = f"{cfg.HF_INFERENCE_ENDPOINT_URL.rstrip('/')}/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {cfg.HF_API_TOKEN}",
+            "Content-Type": "application/json",
+        }
+        openai_messages = [
+            {"role": m["role"], "content": _to_openai_content(m["content"])}
+            for m in messages
+        ]
+        payload = {"model": "tgi", "messages": openai_messages, "max_tokens": 64}
+
+        resp = requests.post(url, headers=headers, json=payload, timeout=30)
         resp.raise_for_status()
-        payload = resp.json()
-        if isinstance(payload, list) and payload:
-            return payload[0].get("generated_text", "")
-        return str(payload)
+        data = resp.json()
+        return data["choices"][0]["message"]["content"]
 
     clf = _model_state["pipeline"]
     if clf is None:
         raise RuntimeError("MedGemma model not loaded")
     output = clf(text=messages, max_new_tokens=64)
-    # image-text-to-text pipeline returns [{"generated_text": [...chat turns...]}]
     generated = output[0]["generated_text"]
     if isinstance(generated, list):
-        # last turn is the assistant's reply
         return generated[-1].get("content", "") if isinstance(generated[-1], dict) else str(generated[-1])
     return str(generated)
 
 
 def infer(text: str) -> TriageResult:
-    """
-    Run triage inference. On any failure — model not loaded, gated-
-    access error, malformed/unparseable output — returns
-    ASSESSMENT_UNAVAILABLE rather than fabricating an urgency result
-    (step 4.5).
-    """
     cfg = get_config()
     try:
         if not text or not text.strip():

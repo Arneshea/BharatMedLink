@@ -1,6 +1,7 @@
 import { Route, Routes } from 'react-router-dom'
 
 import Landing from './pages/Landing.jsx'
+import EmergencyCountdown from './pages/patient/EmergencyCountdown.jsx'
 
 import PatientLayout from './layouts/PatientLayout.jsx'
 import HospitalLayout from './layouts/HospitalLayout.jsx'
@@ -31,6 +32,7 @@ export default function App() {
         <Route path="options" element={<PatientHospitalOptions />} />
         <Route path="journey" element={<PatientJourneyTracking />} />
         <Route path="referral" element={<PatientReferral />} />
+        <Route path="emergency-countdown" element={<EmergencyCountdown />} />
         <Route path="emergency-status" element={<EmergencyStatus />} />
       </Route>
 
