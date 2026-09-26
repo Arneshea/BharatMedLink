@@ -19,6 +19,7 @@ not in Flask or React (step 4.12).
 import math
 from datetime import datetime, timedelta, timezone
 
+import psycopg2.errors
 from flask import Blueprint, jsonify, request
 
 from app.services.db import get_cursor, get_prototype_config, record_audit_event
@@ -45,7 +46,7 @@ def create_patient_request():
     location_lon = body.get("location_lon")
     urgency = body.get("urgency", "unknown")
     symptom_summary = body.get("symptom_summary", "")
-    requirements = body.get("requirements", [])  # from the Stage-1 policy layer output
+    requirements = body.get("requirements", [])
 
     if not all([patient_id, location_lat is not None, location_lon is not None]):
         return jsonify({"error": "patient_id, location_lat, location_lon are required"}), 400
@@ -54,80 +55,81 @@ def create_patient_request():
     top_n = get_prototype_config("stage1_broadcast_top_n", 5)
     response_timeout = get_prototype_config("stage1_response_timeout_seconds", 120)
 
-    with get_cursor(commit=True) as cur:
-        # journeys start at AT_HOME -> REQUESTING_HOSPITAL (section 0.2 / step 4.9)
-        cur.execute(
-            "insert into journeys (patient_id, current_stage, current_status) "
-            "values (%s, 'STAGE1', 'AT_HOME') returning journey_id",
-            (patient_id,),
-        )
-        journey_id = cur.fetchone()["journey_id"]
-        assert_journey_transition("AT_HOME", "REQUESTING_HOSPITAL")
+    try:
+        with get_cursor(commit=True) as cur:
+            cur.execute(
+                "insert into journeys (patient_id, current_stage, current_status) "
+                "values (%s, 'STAGE1', 'AT_HOME') returning journey_id",
+                (patient_id,),
+            )
+            journey_id = cur.fetchone()["journey_id"]
+            assert_journey_transition("AT_HOME", "REQUESTING_HOSPITAL")
 
-        cur.execute(
-            """
-            insert into patient_requests
-                (journey_id, patient_id, requester_user_id_optional, requester_role_optional,
-                 urgency, location_lat, location_lon, symptom_summary, requirements_snapshot,
-                 status, expires_at)
-            values (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'SUBMITTED', %s)
-            returning id, created_at
-            """,
-            (
-                journey_id, patient_id,
-                body.get("requester_user_id_optional"), body.get("requester_role_optional"),
-                urgency, location_lat, location_lon, symptom_summary,
-                _json(requirements),
-                datetime.now(timezone.utc) + timedelta(seconds=response_timeout),
-            ),
-        )
-        req_row = cur.fetchone()
-        request_id = req_row["id"]
-
-        cur.execute(
-            "update journeys set stage1_request_id = %s, current_status = 'REQUESTING_HOSPITAL' where journey_id = %s",
-            (request_id, journey_id),
-        )
-
-        # Candidate generation: nearby + capability match (step 4.14).
-        # This is intentionally simpler than the Stage-2 referral engine
-        # (no scored ranking) — Stage-1 just orders by travel estimate
-        # (step 4.15) and broadcasts to the configured top-N.
-        cur.execute("select id, name, latitude, longitude from hospitals")
-        hospitals = cur.fetchall()
-
-        mandatory_types = {r["requirement_type"] for r in requirements if r.get("mandatory", True)}
-        candidates = []
-        for h in hospitals:
-            if _distance_km(location_lat, location_lon, h["latitude"], h["longitude"]) > radius_km:
-                continue
-            cur.execute("select capability from hospital_capabilities where hospital_id = %s", (h["id"],))
-            caps = {r["capability"] for r in cur.fetchall()}
-            if not mandatory_types.issubset(caps):
-                continue
-            route = get_travel_estimate(location_lat, location_lon, h["latitude"], h["longitude"])
-            candidates.append((h, route))
-
-        candidates.sort(key=lambda c: (c[1].travel_seconds is None, c[1].travel_seconds or 0))
-        broadcast_set = candidates[:top_n]
-
-        for h, route in broadcast_set:
             cur.execute(
                 """
-                insert into patient_request_responses
-                    (request_id, hospital_id, status, expires_at, travel_seconds_optional)
-                values (%s, %s, 'PENDING', %s, %s)
+                insert into patient_requests
+                    (journey_id, patient_id, requester_user_id_optional, requester_role_optional,
+                     urgency, location_lat, location_lon, symptom_summary, requirements_snapshot,
+                     status, expires_at)
+                values (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'SUBMITTED', %s)
+                returning id, created_at
                 """,
                 (
-                    request_id, h["id"],
+                    journey_id, patient_id,
+                    body.get("requester_user_id_optional"), body.get("requester_role_optional"),
+                    urgency, location_lat, location_lon, symptom_summary,
+                    _json(requirements),
                     datetime.now(timezone.utc) + timedelta(seconds=response_timeout),
-                    route.travel_seconds,
                 ),
             )
+            req_row = cur.fetchone()
+            request_id = req_row["id"]
 
-        new_status = "BROADCASTING" if broadcast_set else "NO_MATCH"
-        assert_stage1_request_transition("SUBMITTED", new_status)
-        cur.execute("update patient_requests set status = %s where id = %s", (new_status, request_id))
+            cur.execute(
+                "update journeys set stage1_request_id = %s, current_status = 'REQUESTING_HOSPITAL' where journey_id = %s",
+                (request_id, journey_id),
+            )
+
+            cur.execute("select id, name, latitude, longitude from hospitals")
+            hospitals = cur.fetchall()
+
+            mandatory_types = {r["requirement_type"] for r in requirements if r.get("mandatory", True)}
+            candidates = []
+            for h in hospitals:
+                if _distance_km(location_lat, location_lon, h["latitude"], h["longitude"]) > radius_km:
+                    continue
+                cur.execute("select capability from hospital_capabilities where hospital_id = %s", (h["id"],))
+                caps = {r["capability"] for r in cur.fetchall()}
+                if not mandatory_types.issubset(caps):
+                    continue
+                route = get_travel_estimate(location_lat, location_lon, h["latitude"], h["longitude"])
+                candidates.append((h, route))
+
+            candidates.sort(key=lambda c: (c[1].travel_seconds is None, c[1].travel_seconds or 0))
+            broadcast_set = candidates[:top_n]
+
+            for h, route in broadcast_set:
+                cur.execute(
+                    """
+                    insert into patient_request_responses
+                        (request_id, hospital_id, status, expires_at, travel_seconds_optional)
+                    values (%s, %s, 'PENDING', %s, %s)
+                    """,
+                    (
+                        request_id, h["id"],
+                        datetime.now(timezone.utc) + timedelta(seconds=response_timeout),
+                        route.travel_seconds,
+                    ),
+                )
+
+            new_status = "BROADCASTING" if broadcast_set else "NO_MATCH"
+            assert_stage1_request_transition("SUBMITTED", new_status)
+            cur.execute("update patient_requests set status = %s where id = %s", (new_status, request_id))
+    except psycopg2.errors.UniqueViolation:
+        return jsonify({
+            "error": "ACTIVE_REQUEST_EXISTS",
+            "detail": "This patient already has an active request in progress. Cancel it first, or wait for it to resolve.",
+        }), 409
 
     record_audit_event(
         body.get("requester_user_id_optional"), body.get("requester_role_optional"),
@@ -181,7 +183,6 @@ def get_patient_request(request_id):
 
 @bp.get("/hospitals/<hospital_id>/patient-request-responses")
 def list_hospital_request_responses(hospital_id):
-    """Pending/recent Stage-1 broadcasts for a hospital's dashboard (step 5.2)."""
     with get_cursor() as cur:
         cur.execute(
             """
@@ -205,14 +206,9 @@ def list_hospital_request_responses(hospital_id):
             d["responded_at"] = d["responded_at"].isoformat()
         if d.get("expires_at"):
             d["expires_at"] = d["expires_at"].isoformat()
-
-        # Step 4.8: exact coordinates are only disclosed once this
-        # hospital has actually accepted (i.e. is a real candidate the
-        # patient may select), not on the initial PENDING broadcast.
         if d["status"] == "PENDING":
             d["location_lat"] = None
             d["location_lon"] = None
-
         result.append(d)
     return jsonify(result), 200
 
@@ -233,8 +229,6 @@ def accept_response(response_id):
         if cur.rowcount == 0:
             return jsonify({"error": "RESPONSE_NOT_PENDING"}), 409
 
-        # Move the request into PATIENT_SELECTING the first time any
-        # hospital accepts (step 4.12).
         cur.execute("select status from patient_requests where id = %s", (resp["request_id"],))
         req_status = cur.fetchone()["status"]
         if req_status == "BROADCASTING":
@@ -265,7 +259,6 @@ def decline_response(response_id):
 
 @bp.post("/patient-requests/<request_id>/select")
 def select_hospital(request_id):
-    """Patient selects one ACCEPTED hospital — atomic (step 4.12)."""
     body = request.get_json(force=True) or {}
     hospital_id = body.get("hospital_id")
     if not hospital_id:
@@ -284,13 +277,6 @@ def select_hospital(request_id):
 
 @bp.post("/patient-request-responses/<response_id>/confirm")
 def confirm_selection(response_id):
-    """
-    Hospital confirms after revalidating current state (step 4.12).
-    `still_eligible` is computed by the caller (hospital dashboard) by
-    re-reading current hospital_state; the prototype accepts it as a
-    body param here to keep the demo simple, but production should
-    re-check server-side against live hospital_state before trusting it.
-    """
     body = request.get_json(force=True) or {}
     still_eligible = bool(body.get("still_eligible", True))
 

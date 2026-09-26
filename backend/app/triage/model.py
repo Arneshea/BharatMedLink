@@ -13,13 +13,38 @@ That changes how "inference" works here compared to a classifier:
     we treat it as ASSESSMENT_UNAVAILABLE (step 4.5) rather than
     guessing.
   - `model_scores_optional` is therefore always None for this model.
-  - Because MedGemma is multimodal, this same model is reused by
-    app/triage/document_parser.py to read a scanned referral letter.
+  - Because MedGemma is multimodal, this same loaded model/processor is
+    reused by app/triage/document_parser.py to read a scanned referral
+    letter (image input). The model is loaded exactly once at process
+    startup either way (never per request).
+
+LOCAL LOADING NOTES (debugged the hard way — do not change casually):
+
+  - MUST use bfloat16, not float16, for both `dtype` and
+    `bnb_4bit_compute_dtype`. Gemma-family models (Gemma 2/3, and
+    MedGemma which is built on Gemma 3) are trained in bf16 and are
+    numerically unstable in fp16 — fp16 produces corrupted,
+    multilingual-garbage token output that still "generates" without
+    erroring, which makes it a nasty silent failure. This bit us once;
+    don't reintroduce float16 here.
+  - MUST use `attn_implementation="eager"`. Some SDPA + bitsandbytes-
+    quantization combinations for Gemma3-family image-text-to-text
+    models produce the same kind of corrupted output as the fp16 bug
+    above, even with bf16 correctly set. Eager attention avoided it in
+    testing.
+  - Avoid mixed-precision CPU offload (e.g.
+    `llm_int8_enable_fp32_cpu_offload=True` combined with GPU int8).
+    The fp32-CPU / int8-GPU boundary was another source of corrupted
+    output. Prefer `device_map={"": 0}` (everything on one GPU) with
+    4-bit NF4 quantization. If that OOMs on your GPU, revisit offload
+    but keep dtypes consistent across the boundary — don't casually
+    reach for fp32 CPU + int8 GPU again without retesting output
+    quality first.
 
 API-only mode (HF_USE_HOSTED_INFERENCE_API=true): calls a dedicated HF
-Inference Endpoint's OpenAI-compatible Messages API. MedGemma is NOT
-on HF's free shared serverless API, so HF_INFERENCE_ENDPOINT_URL must
-be set — see config.py.
+Inference Endpoint's OpenAI-compatible Messages API instead of any of
+the above. MedGemma is NOT on HF's free shared serverless API, so
+HF_INFERENCE_ENDPOINT_URL must be set — see config.py.
 """
 
 import re
@@ -33,7 +58,8 @@ from app.config import get_config
 
 _model_state: Dict = {
     "loaded": False,
-    "pipeline": None,
+    "processor": None,
+    "model": None,
     "load_seconds": None,
     "model_name": None,
     "model_revision": None,
@@ -55,13 +81,14 @@ TRIAGE_SYSTEM_PROMPT = (
 
 @dataclass
 class TriageResult:
-    label: str
-    scores: Optional[dict] = None
+    label: str  # one of TRIAGE_LABELS, or "ASSESSMENT_UNAVAILABLE"
+    scores: Optional[dict] = None  # always None for MedGemma — see module docstring
     model_name: str = ""
     model_version: str = ""
 
 
 def is_ready() -> bool:
+    """Used by GET /ready — never report ready if the model isn't usable."""
     cfg = get_config()
     if cfg.HF_USE_HOSTED_INFERENCE_API:
         return bool(cfg.HF_API_TOKEN) and bool(cfg.HF_INFERENCE_ENDPOINT_URL)
@@ -69,8 +96,27 @@ def is_ready() -> bool:
 
 
 def warm_up():
+    """
+    Call once at process startup (see app/__init__.py — currently run
+    in a background thread so the rest of the app can start serving
+    immediately; /ready reports not-ready until this finishes).
+
+    Local mode loads google/medgemma-1.5-4b-it with 4-bit NF4
+    quantization, entirely on GPU (device_map={"": 0}), in bfloat16,
+    with eager attention — see the module docstring for why each of
+    those specific choices matters; this configuration was arrived at
+    after debugging corrupted-output failures with float16 and with
+    mixed CPU/GPU offload.
+
+    google/medgemma-1.5-4b-it is a GATED model on Hugging Face: your
+    HF_API_TOKEN's account must have accepted Google's license on the
+    model page, or this will fail with a 401/403 — that failure is
+    caught and surfaced through get_load_metrics()["load_error"], not
+    raised, so the rest of the app can still start.
+    """
     cfg = get_config()
     if cfg.HF_USE_HOSTED_INFERENCE_API:
+        # Nothing to preload locally; readiness just checks config is present.
         _model_state["model_name"] = cfg.HF_TRIAGE_MODEL_NAME
         _model_state["model_revision"] = cfg.HF_TRIAGE_MODEL_REVISION
         if not cfg.HF_INFERENCE_ENDPOINT_URL:
@@ -84,25 +130,43 @@ def warm_up():
 
     start = time.time()
     try:
-        from transformers import pipeline
+        import torch
+        from transformers import AutoProcessor, AutoModelForImageTextToText, BitsAndBytesConfig
 
-        clf = pipeline(
-            "image-text-to-text",
-            model=cfg.HF_TRIAGE_MODEL_NAME,
-            revision=cfg.HF_TRIAGE_MODEL_REVISION,
+        quant_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,  # NOT float16 — see module docstring
+            bnb_4bit_use_double_quant=True,
+        )
+
+        processor = AutoProcessor.from_pretrained(
+            cfg.HF_TRIAGE_MODEL_NAME,
             token=cfg.HF_API_TOKEN or None,
         )
-        _model_state["pipeline"] = clf
+        model = AutoModelForImageTextToText.from_pretrained(
+            cfg.HF_TRIAGE_MODEL_NAME,
+            revision=cfg.HF_TRIAGE_MODEL_REVISION,
+            token=cfg.HF_API_TOKEN or None,
+            quantization_config=quant_config,
+            device_map={"": 0},          # everything on one GPU — no CPU offload
+            dtype=torch.bfloat16,
+            attn_implementation="eager",  # avoids corrupted-output bug on Gemma3 family
+        )
+
+        _model_state["processor"] = processor
+        _model_state["model"] = model
         _model_state["loaded"] = True
         _model_state["model_name"] = cfg.HF_TRIAGE_MODEL_NAME
         _model_state["model_revision"] = cfg.HF_TRIAGE_MODEL_REVISION
         _model_state["load_seconds"] = time.time() - start
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - deliberate: log and stay not-ready
         _model_state["loaded"] = False
         _model_state["load_error"] = str(exc)
 
 
 def get_load_metrics() -> dict:
+    """Section 41S: measure load time / memory during development."""
     return {
         "loaded": _model_state["loaded"],
         "load_seconds": _model_state.get("load_seconds"),
@@ -121,6 +185,12 @@ def _parse_label(generated_text: str) -> Optional[str]:
 
 
 def _to_openai_content(content_items: list) -> list:
+    """
+    Convert our internal message-content shape (used for local
+    generation, e.g. {"type": "image", "image": "data:..."}) into the
+    OpenAI-compatible shape a dedicated HF Inference Endpoint's
+    Messages API expects (e.g. {"type": "image_url", "image_url": {"url": "data:..."}}).
+    """
     converted = []
     for item in content_items:
         if item["type"] == "image":
@@ -131,13 +201,17 @@ def _to_openai_content(content_items: list) -> list:
 
 
 def _run_chat(messages: list) -> str:
+    """Shared chat-completion call used by both triage and document parsing."""
     cfg = get_config()
+
     if cfg.HF_USE_HOSTED_INFERENCE_API:
         if not cfg.HF_INFERENCE_ENDPOINT_URL:
             raise RuntimeError(
-                "HF_INFERENCE_ENDPOINT_URL is not set. Deploy a dedicated "
-                "HF Inference Endpoint and set its URL."
+                "HF_INFERENCE_ENDPOINT_URL is not set. MedGemma is not available "
+                "on HF's free shared serverless API — deploy a dedicated Inference "
+                "Endpoint and set its URL. See docs/PROTOTYPE_LIMITATIONS.md."
             )
+
         url = f"{cfg.HF_INFERENCE_ENDPOINT_URL.rstrip('/')}/v1/chat/completions"
         headers = {
             "Authorization": f"Bearer {cfg.HF_API_TOKEN}",
@@ -154,17 +228,38 @@ def _run_chat(messages: list) -> str:
         data = resp.json()
         return data["choices"][0]["message"]["content"]
 
-    clf = _model_state["pipeline"]
-    if clf is None:
+    # --- Local generation ---------------------------------------------------
+    import torch
+
+    processor = _model_state["processor"]
+    model = _model_state["model"]
+    if model is None or processor is None:
         raise RuntimeError("MedGemma model not loaded")
-    output = clf(text=messages, max_new_tokens=64)
-    generated = output[0]["generated_text"]
-    if isinstance(generated, list):
-        return generated[-1].get("content", "") if isinstance(generated[-1], dict) else str(generated[-1])
-    return str(generated)
+
+    inputs = processor.apply_chat_template(
+        messages,
+        add_generation_prompt=True,
+        tokenize=True,
+        return_dict=True,
+        return_tensors="pt",
+    ).to(model.device)
+
+    with torch.inference_mode():
+        output = model.generate(**inputs, max_new_tokens=64, do_sample=False)
+
+    decoded = processor.batch_decode(
+        output[:, inputs["input_ids"].shape[-1]:], skip_special_tokens=True
+    )
+    return decoded[0]
 
 
 def infer(text: str) -> TriageResult:
+    """
+    Run triage inference. On any failure — model not loaded, gated-
+    access error, malformed/unparseable output — returns
+    ASSESSMENT_UNAVAILABLE rather than fabricating an urgency result
+    (step 4.5).
+    """
     cfg = get_config()
     try:
         if not text or not text.strip():

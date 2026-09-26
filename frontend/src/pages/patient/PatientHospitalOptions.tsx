@@ -15,10 +15,13 @@ const STATUS_BADGE = {
 
 export default function PatientHospitalOptions() {
   const [requestId] = useLocalState('demo.requestId', null)
+  const [, setTransportMode] = useLocalState('demo.transportMode', null)
   const [requestData, setRequestData] = useState(null)
   const [realtimeStatus, setRealtimeStatus] = useState('UNCONFIGURED')
   const [error, setError] = useState(null)
   const [busy, setBusy] = useState(false)
+  const [selectedHospitalId, setSelectedHospitalId] = useState(null)
+  const [showTransportModal, setShowTransportModal] = useState(false)
   const navigate = useNavigate()
 
   async function refresh() {
@@ -36,7 +39,7 @@ export default function PatientHospitalOptions() {
 
   useEffect(() => {
     refresh()
-    const interval = setInterval(refresh, 4000) // fallback poll alongside realtime
+    const interval = setInterval(refresh, 4000)
     const unsubscribe = subscribeToTable({
       table: 'patient_request_responses',
       filter: `request_id=eq.${requestId}`,
@@ -50,11 +53,20 @@ export default function PatientHospitalOptions() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [requestId])
 
-  async function handleSelect(hospitalId) {
+  // Step 1: patient taps "Select this hospital" → show transport modal
+  function promptTransport(hospitalId) {
+    setSelectedHospitalId(hospitalId)
+    setShowTransportModal(true)
+  }
+
+  // Step 2: patient picks ambulance or self-drive → confirm selection
+  async function handleSelectWithMode(mode) {
+    setShowTransportModal(false)
+    setTransportMode(mode)
     setError(null)
     setBusy(true)
     try {
-      await api.selectHospital(requestId, hospitalId)
+      await api.selectHospital(requestId, selectedHospitalId)
       await refresh()
     } catch (err) {
       setError(err?.response?.data?.error || 'Selection failed')
@@ -88,6 +100,43 @@ export default function PatientHospitalOptions() {
       )}
       {error && <div className="error-banner">{error}</div>}
 
+      {/* Transport mode modal */}
+      {showTransportModal && (
+        <div className="transport-modal-overlay">
+          <div className="transport-modal">
+            <h3>How will you get there?</h3>
+            <p className="subtitle" style={{ marginBottom: 24 }}>
+              Choose your transport to the selected hospital. This helps the hospital prepare for your arrival.
+            </p>
+            <div className="transport-options">
+              <button
+                className="transport-btn ambulance"
+                onClick={() => handleSelectWithMode('AMBULANCE')}
+              >
+                <span className="transport-icon">🚑</span>
+                <span className="transport-label">Request Ambulance</span>
+                <span className="transport-desc">Emergency services will come to you</span>
+              </button>
+              <button
+                className="transport-btn selfdrive"
+                onClick={() => handleSelectWithMode('SELF_DRIVE')}
+              >
+                <span className="transport-icon">🚗</span>
+                <span className="transport-label">Self-Drive / Walk</span>
+                <span className="transport-desc">You'll make your own way there</span>
+              </button>
+            </div>
+            <button
+              className="secondary"
+              style={{ marginTop: 16, width: '100%' }}
+              onClick={() => setShowTransportModal(false)}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
       <div className="panel">
         <h3>Hospitals contacted</h3>
         {requestData.responses.length === 0 && <p>No hospitals were within range for this request.</p>}
@@ -96,13 +145,17 @@ export default function PatientHospitalOptions() {
             <div>
               <strong>{r.hospital_name}</strong>
               <div className="mono">
-                {r.travel_seconds_optional != null ? `${Math.round(r.travel_seconds_optional / 60)} min estimated travel` : 'travel estimate unavailable'}
+                {r.travel_seconds_optional != null
+                  ? `${Math.round(r.travel_seconds_optional / 60)} min estimated travel`
+                  : 'travel estimate unavailable'}
               </div>
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
               <span className={`badge ${STATUS_BADGE[r.status] || 'neutral'}`}>{r.status}</span>
               {r.status === 'ACCEPTED' && requestData.status === 'PATIENT_SELECTING' && (
-                <button disabled={busy} onClick={() => handleSelect(r.hospital_id)}>Select this hospital</button>
+                <button disabled={busy} onClick={() => promptTransport(r.hospital_id)}>
+                  Select this hospital
+                </button>
               )}
               {r.status === 'ACCEPTED' && requestData.selected_hospital_id_optional === r.hospital_id && (
                 <span className="badge good">Selected — awaiting confirmation</span>

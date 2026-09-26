@@ -16,11 +16,14 @@ export default function PatientAssessment() {
   const [requesterRole] = useLocalState('demo.requesterRole', 'PATIENT')
   const [, setRequestId] = useLocalState('demo.requestId', null)
   const [, setJourneyId] = useLocalState('demo.journeyId', null)
+  const [, setPatientLat] = useLocalState('demo.patientLat', null)
+  const [, setPatientLon] = useLocalState('demo.patientLon', null)
 
   const [rawInput, setRawInput] = useState('')
   const [concerns, setConcerns] = useState([])
   const [lat, setLat] = useState('28.6200')
   const [lon, setLon] = useState('77.2100')
+  const [geoLoading, setGeoLoading] = useState(false)
   const [assessment, setAssessment] = useState(null)
   const [error, setError] = useState(null)
   const [busy, setBusy] = useState(false)
@@ -28,6 +31,26 @@ export default function PatientAssessment() {
 
   function toggleConcern(key) {
     setConcerns((prev) => (prev.includes(key) ? prev.filter((c) => c !== key) : [...prev, key]))
+  }
+
+  function handleGeolocate() {
+    if (!navigator.geolocation) {
+      setError('Geolocation is not supported by your browser.')
+      return
+    }
+    setGeoLoading(true)
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        setLat(pos.coords.latitude.toFixed(6))
+        setLon(pos.coords.longitude.toFixed(6))
+        setGeoLoading(false)
+      },
+      () => {
+        setError('Could not get your location. Please enter coordinates manually.')
+        setGeoLoading(false)
+      },
+      { timeout: 8000 },
+    )
   }
 
   async function handleAssess(e) {
@@ -62,6 +85,9 @@ export default function PatientAssessment() {
         requirements: assessment.requirements,
         requester_role_optional: requesterRole,
       })
+      // Store patient coords so journey map can draw routes
+      setPatientLat(Number(lat))
+      setPatientLon(Number(lon))
       setRequestId(result.request_id)
       setJourneyId(result.journey_id)
       navigate('/patient/options')
@@ -104,15 +130,21 @@ export default function PatientAssessment() {
           </div>
         ))}
 
-        <div className="grid-2">
+        <label>Your location</label>
+        <div className="grid-2" style={{ alignItems: 'flex-end' }}>
           <div>
-            <label>Latitude</label>
+            <label style={{ marginTop: 0 }}>Latitude</label>
             <input value={lat} onChange={(e) => setLat(e.target.value)} />
           </div>
           <div>
-            <label>Longitude</label>
+            <label style={{ marginTop: 0 }}>Longitude</label>
             <input value={lon} onChange={(e) => setLon(e.target.value)} />
           </div>
+        </div>
+        <div style={{ marginTop: 8 }}>
+          <button type="button" className="secondary" onClick={handleGeolocate} disabled={geoLoading}>
+            {geoLoading ? '📍 Detecting…' : '📍 Use my current location'}
+          </button>
         </div>
         <p className="footnote">
           Only used internally for candidate matching/routing — exact coordinates are not shown to
