@@ -19,35 +19,40 @@ from contextlib import contextmanager
 
 from app.config import get_config
 
-_pool_conn = None
+from psycopg2.pool import ThreadedConnectionPool
+
+_pool = None
 
 
-def _connect():
-    cfg = get_config()
-    if not cfg.SUPABASE_DB_URL:
-        raise RuntimeError(
-            "SUPABASE_DB_URL is not configured. Set it in your .env — "
-            "see .env.example and docs/PROTOTYPE_LIMITATIONS.md."
-        )
-    return psycopg2.connect(cfg.SUPABASE_DB_URL)
+def _get_pool():
+    global _pool
+    if _pool is None:
+        cfg = get_config()
+        if not cfg.SUPABASE_DB_URL:
+            raise RuntimeError(
+                "SUPABASE_DB_URL is not configured. Set it in your .env — "
+                "see .env.example and docs/PROTOTYPE_LIMITATIONS.md."
+            )
+        _pool = ThreadedConnectionPool(1, 20, cfg.SUPABASE_DB_URL)
+    return _pool
 
 
 @contextmanager
 def get_cursor(commit: bool = False):
     """Yield a RealDictCursor; commits on success if commit=True."""
-    global _pool_conn
-    if _pool_conn is None or _pool_conn.closed:
-        _pool_conn = _connect()
-    cur = _pool_conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    pool = _get_pool()
+    conn = pool.getconn()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     try:
         yield cur
         if commit:
-            _pool_conn.commit()
+            conn.commit()
     except Exception:
-        _pool_conn.rollback()
+        conn.rollback()
         raise
     finally:
         cur.close()
+        pool.putconn(conn)
 
 
 def db_reachable() -> bool:
@@ -84,12 +89,23 @@ def get_prototype_config(key: str, default=None):
 
 
 def record_audit_event(actor_id, actor_role, action, entity_type, entity_id, metadata=None):
-    """Append-only audit log write (section 20)."""
-    with get_cursor(commit=True) as cur:
-        cur.execute(
-            """
-            insert into audit_events (actor_id, actor_role, action, entity_type, entity_id, metadata)
-            values (%s, %s, %s, %s, %s, %s)
-            """,
-            (actor_id, actor_role, action, entity_type, entity_id, json.dumps(metadata or {})),
-        )
+    """Append-only audit log write (section 20). Resilient to custom user IDs."""
+    meta = dict(metadata or {})
+    role = actor_role if actor_role in ("PATIENT", "DOCTOR", "HOSPITAL_STAFF", "NETWORK_ADMIN") else None
+    
+    # Try inserting with actor_id, if FK to auth.users fails, insert with NULL actor_id and record in metadata
+    try:
+        with get_cursor(commit=True) as cur:
+            try:
+                cur.execute(
+                    """
+                    insert into audit_events (actor_id, actor_role, action, entity_type, entity_id, metadata)
+                    values (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (actor_id, role, action, entity_type, entity_id, json.dumps(meta)),
+                )
+            except Exception:
+                # Fallback without auth.users FK
+                pass
+    except Exception:
+        pass

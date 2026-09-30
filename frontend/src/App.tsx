@@ -1,52 +1,105 @@
-import { Route, Routes } from 'react-router-dom'
+import React from 'react'
+import { Route, Routes, Navigate } from 'react-router-dom'
+import { AuthProvider, useAuth } from './context/AuthContext'
+import RootLayout from './layouts/RootLayout'
 
-import Landing from './pages/Landing.jsx'
-import EmergencyCountdown from './pages/patient/EmergencyCountdown.jsx'
+// Core Flow Pages (matching uploaded UI mockups)
+import HospitalDashboard from './pages/hospital/HospitalDashboard'
+import InitiateReferral from './pages/hospital/InitiateReferral'
+import HospitalMatching from './pages/hospital/HospitalMatching'
+import TransferConfirmed from './pages/hospital/TransferConfirmed'
+import NetworkOverview from './pages/admin/NetworkOverview'
+import AuthPage from './pages/auth/AuthPage'
+import NotificationsPage from './pages/NotificationsPage'
 
-import PatientLayout from './layouts/PatientLayout.jsx'
-import HospitalLayout from './layouts/HospitalLayout.jsx'
-import AdminLayout from './layouts/AdminLayout.jsx'
+// Preserved & Secondary Pages
+import PatientDashboard from './pages/patient/PatientDashboard'
+import PatientHome from './pages/patient/PatientHome'
+import PatientAssessment from './pages/patient/PatientAssessment'
+import PatientHospitalOptions from './pages/patient/PatientHospitalOptions'
+import PatientJourneyTracking from './pages/patient/PatientJourneyTracking'
+import PatientReferral from './pages/patient/PatientReferral'
+import EmergencyStatus from './pages/patient/EmergencyStatus'
+import EmergencyCountdown from './pages/patient/EmergencyCountdown'
+import Simulator from './pages/admin/Simulator'
+import LiveEvents from './pages/admin/LiveEvents'
+import ReferralDetail from './pages/hospital/ReferralDetail'
 
-import PatientHome from './pages/patient/PatientHome.jsx'
-import PatientAssessment from './pages/patient/PatientAssessment.jsx'
-import PatientHospitalOptions from './pages/patient/PatientHospitalOptions.jsx'
-import PatientJourneyTracking from './pages/patient/PatientJourneyTracking.jsx'
-import PatientReferral from './pages/patient/PatientReferral.jsx'
-import EmergencyStatus from './pages/patient/EmergencyStatus.jsx'
+// Guard that ensures user is authenticated; otherwise redirects straight to /login
+const RequireAuth: React.FC<{ allowedRoles?: string[] }> = ({ allowedRoles }) => {
+  const { user } = useAuth()
+  if (!user) {
+    return <Navigate to="/login" replace />
+  }
+  if (allowedRoles && !allowedRoles.includes(user.role)) {
+    if (user.role === 'PATIENT') return <Navigate to="/patient" replace />
+    if (user.role === 'NETWORK_ADMIN') return <Navigate to="/admin" replace />
+    return <Navigate to="/hospital" replace />
+  }
+  return <RootLayout />
+}
 
-import HospitalDashboard from './pages/hospital/HospitalDashboard.jsx'
-import ReferralDetail from './pages/hospital/ReferralDetail.jsx'
+// Root redirect always takes user to the Login page by default (Requirement 8)
+const RoleLandingRedirect: React.FC = () => {
+  return <Navigate to="/login" replace />
+}
 
-import NetworkOverview from './pages/admin/NetworkOverview.jsx'
-import Simulator from './pages/admin/Simulator.jsx'
-import LiveEvents from './pages/admin/LiveEvents.jsx'
+// Public Auth route handler renders the Login / Signup page
+const PublicAuthRoute: React.FC = () => {
+  return <AuthPage />
+}
 
 export default function App() {
   return (
-    <Routes>
-      <Route path="/" element={<Landing />} />
+    <AuthProvider>
+      <Routes>
+        {/* Auth / Login / Signup Routes */}
+        <Route path="/login" element={<PublicAuthRoute />} />
+        <Route path="/auth" element={<PublicAuthRoute />} />
+        <Route path="/signup" element={<PublicAuthRoute />} />
 
-      <Route path="/patient" element={<PatientLayout />}>
-        <Route index element={<PatientHome />} />
-        <Route path="assessment" element={<PatientAssessment />} />
-        <Route path="options" element={<PatientHospitalOptions />} />
-        <Route path="journey" element={<PatientJourneyTracking />} />
-        <Route path="referral" element={<PatientReferral />} />
-        <Route path="emergency-countdown" element={<EmergencyCountdown />} />
-        <Route path="emergency-status" element={<EmergencyStatus />} />
-      </Route>
+        {/* Root Redirect */}
+        <Route path="/" element={<RoleLandingRedirect />} />
 
-      <Route path="/hospital" element={<HospitalLayout />}>
-        <Route index element={<HospitalDashboard />} />
-        <Route path="referral/:referralId" element={<ReferralDetail />} />
-      </Route>
+        {/* Doctor & Hospital Staff Routes Only */}
+        <Route element={<RequireAuth allowedRoles={['HOSPITAL_STAFF']} />}>
+          <Route path="/hospital" element={<HospitalDashboard />} />
+          <Route path="/hospital/referral/:referralId" element={<ReferralDetail />} />
+          <Route path="/referral/new" element={<InitiateReferral />} />
+          <Route path="/referral/:referralId/matches" element={<HospitalMatching />} />
+          <Route path="/referral/matching-demo" element={<HospitalMatching />} />
+          <Route path="/referral/:referralId/handoff" element={<TransferConfirmed />} />
+          <Route path="/referral/handoff-demo" element={<TransferConfirmed />} />
+        </Route>
 
-      <Route path="/admin" element={<AdminLayout />}>
-        <Route index element={<NetworkOverview />} />
-        <Route path="network" element={<NetworkOverview />} />
-        <Route path="simulator" element={<Simulator />} />
-        <Route path="events" element={<LiveEvents />} />
-      </Route>
-    </Routes>
+        {/* Patient Routes Only */}
+        <Route element={<RequireAuth allowedRoles={['PATIENT']} />}>
+          <Route path="/patient" element={<PatientDashboard />} />
+          <Route path="/patient/home" element={<PatientHome />} />
+          <Route path="/patient/assessment" element={<PatientAssessment />} />
+          <Route path="/patient/options" element={<PatientHospitalOptions />} />
+          <Route path="/patient/journey" element={<PatientJourneyTracking />} />
+          <Route path="/patient/referral" element={<PatientReferral />} />
+          <Route path="/patient/emergency-status" element={<EmergencyStatus />} />
+          <Route path="/patient/emergency-countdown" element={<EmergencyCountdown />} />
+        </Route>
+
+        {/* Network Admin Routes Only */}
+        <Route element={<RequireAuth allowedRoles={['NETWORK_ADMIN']} />}>
+          <Route path="/admin" element={<NetworkOverview />} />
+          <Route path="/admin/network" element={<NetworkOverview />} />
+          <Route path="/admin/events" element={<LiveEvents />} />
+          <Route path="/admin/simulator" element={<Simulator />} />
+        </Route>
+
+        {/* Common Authenticated Routes (Accessible by all roles) */}
+        <Route element={<RequireAuth />}>
+          <Route path="/notifications" element={<NotificationsPage />} />
+        </Route>
+
+        {/* Fallback */}
+        <Route path="*" element={<RoleLandingRedirect />} />
+      </Routes>
+    </AuthProvider>
   )
 }

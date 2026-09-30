@@ -63,6 +63,11 @@ def emergency_dispatch():
                 "insert into patients (display_name) values ('Emergency (unidentified)') returning id"
             )
             patient_id = cur.fetchone()["id"]
+        else:
+            cur.execute(
+                "insert into patients (id, display_name) values (%s, 'Patient') on conflict (id) do nothing",
+                (patient_id,),
+            )
 
         cur.execute(
             "insert into journeys (patient_id, current_stage, current_status) "

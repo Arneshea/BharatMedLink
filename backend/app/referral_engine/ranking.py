@@ -32,10 +32,15 @@ from app.config import get_config
 @dataclass
 class RankingFactors:
     hospital_id: str
-    travel_seconds: Optional[float]
-    resource_headroom: Optional[float]  # 0..1, e.g. ICU available/total
-    specialist_available: Optional[float]  # 0/1 (or 0.5 for ON_CALL)
-    freshness: float  # 0..1
+    travel_seconds: Optional[float] = None
+    resource_headroom: Optional[float] = None  # capacity headroom (0..1)
+    specialist_available: Optional[float] = None  # 0..1
+    freshness: float = 1.0  # 0..1
+    clinical_fit: float = 1.0  # 0..1 (35% Clinical Fit)
+    capacity: Optional[float] = None  # 0..1 (15% Capacity)
+    specialist_coverage: Optional[float] = None  # 0..1 (12% Specialist Coverage)
+    historical_reliability: float = 0.90  # 0..1 (8% Historical Reliability)
+    data_freshness: Optional[float] = None  # 0..1 (5% Data Freshness)
     routing_source: str = "UNKNOWN"
 
 
@@ -61,7 +66,14 @@ def _normalize_travel_time(travel_seconds: Optional[float], all_travel_seconds: 
 def rank_candidates(candidates: list[RankingFactors]) -> list[RankedCandidate]:
     weights = get_prototype_config(
         "ranking_weights_v1",
-        {"travel_time": 0.35, "resource_headroom": 0.30, "specialist_availability": 0.20, "state_freshness": 0.15},
+        {
+            "clinical_fit": 0.35,
+            "travel_time": 0.25,
+            "capacity": 0.15,
+            "specialist_coverage": 0.12,
+            "historical_reliability": 0.08,
+            "state_freshness": 0.05,
+        },
     )
     tie_breakers = get_prototype_config("ranking_tie_breakers", ["freshness", "travel_time", "hospital_id"])
     policy_version = get_config().RANKING_POLICY_VERSION
@@ -71,24 +83,38 @@ def rank_candidates(candidates: list[RankingFactors]) -> list[RankedCandidate]:
     ranked = []
     for c in candidates:
         norm_travel = _normalize_travel_time(c.travel_seconds, all_travel)
-        norm_headroom = c.resource_headroom if c.resource_headroom is not None else 0.0
-        norm_specialist = c.specialist_available if c.specialist_available is not None else 0.0
-        norm_freshness = c.freshness
+        norm_fit = c.clinical_fit if c.clinical_fit is not None else 1.0
+        norm_capacity = c.capacity if c.capacity is not None else (c.resource_headroom if c.resource_headroom is not None else 0.7)
+        norm_specialist = c.specialist_coverage if c.specialist_coverage is not None else (c.specialist_available if c.specialist_available is not None else 0.8)
+        norm_reliability = c.historical_reliability if c.historical_reliability is not None else 0.90
+        norm_freshness = c.data_freshness if c.data_freshness is not None else c.freshness
+
+        # Clinical Fit: 35%, Travel ETA: 25%, Capacity: 15%, Specialist Coverage: 12%, Reliability: 8%, Freshness: 5%
+        w_fit = weights.get("clinical_fit", 0.35)
+        w_travel = weights.get("travel_time", 0.25)
+        w_cap = weights.get("capacity", weights.get("resource_headroom", 0.15))
+        w_spec = weights.get("specialist_coverage", weights.get("specialist_availability", 0.12))
+        w_rel = weights.get("historical_reliability", 0.08)
+        w_fresh = weights.get("state_freshness", 0.05)
 
         score = (
-            weights["travel_time"] * norm_travel
-            + weights["resource_headroom"] * norm_headroom
-            + weights["specialist_availability"] * norm_specialist
-            + weights["state_freshness"] * norm_freshness
+            w_fit * norm_fit
+            + w_travel * norm_travel
+            + w_cap * norm_capacity
+            + w_spec * norm_specialist
+            + w_rel * norm_reliability
+            + w_fresh * norm_freshness
         )
 
         factors = {
+            "clinical_fit": round(norm_fit, 4),
             "travel_time_normalized": round(norm_travel, 4),
             "travel_seconds": c.travel_seconds,
-            "routing_source": c.routing_source,
-            "resource_headroom": round(norm_headroom, 4),
-            "specialist_available": norm_specialist,
+            "capacity": round(norm_capacity, 4),
+            "specialist_coverage": round(norm_specialist, 4),
+            "historical_reliability": round(norm_reliability, 4),
             "freshness": round(norm_freshness, 4),
+            "routing_source": c.routing_source,
             "policy_version": policy_version,
         }
         ranked.append(RankedCandidate(hospital_id=c.hospital_id, score=round(score, 6), factors=factors))

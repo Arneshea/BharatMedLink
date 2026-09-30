@@ -36,6 +36,8 @@ def create_app():
     from app.routes.simulator import bp as simulator_bp
     from app.routes.journeys import bp as journeys_bp
     from app.routes.emergency import bp as emergency_bp
+    from app.routes.auth import bp as auth_bp
+    from app.routes.notifications import bp as notifications_bp
 
     app.register_blueprint(health_bp)
     app.register_blueprint(hospitals_bp)
@@ -46,5 +48,8 @@ def create_app():
     app.register_blueprint(simulator_bp)
     app.register_blueprint(journeys_bp)
     app.register_blueprint(emergency_bp)
+    app.register_blueprint(auth_bp)
+    app.register_blueprint(notifications_bp)
+
 
     return app

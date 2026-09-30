@@ -1,15 +1,20 @@
 import { useEffect, useRef, useState } from 'react'
+import { Link } from 'react-router-dom'
+import { Ambulance, RotateCcw, Upload, FileText, CheckCircle2, ArrowRight } from 'lucide-react'
 
 import { api } from '../../services/api.js'
 import { useLocalState } from '../../hooks/useLocalState.js'
+import { useAuth } from '../../context/AuthContext'
 
 const REQUIREMENT_OPTIONS = ['ICU', 'NEUROLOGY', 'CT', 'CARDIOLOGY', 'EMERGENCY']
 
 export default function PatientReferral() {
-  const [patientId] = useLocalState('demo.patientId', null)
-  const [journeyId] = useLocalState('demo.journeyId', null)
+  const { user } = useAuth()
+  const [demoPatientId] = useLocalState('demo.patientId', null)
+  const patientId = user?.id || demoPatientId || 'fe766272-ca89-4659-a8bb-50233ca9da35'
+  const [journeyId, setJourneyId] = useLocalState('demo.journeyId', null)
 
-  const [mode, setMode] = useState('scan') // 'scan' | 'manual'
+  const [mode, setMode] = useState<'scan' | 'manual'>('scan')
   const [imagePreview, setImagePreview] = useState(null)
   const [imageBase64, setImageBase64] = useState(null)
   const [extraText, setExtraText] = useState('')
@@ -22,7 +27,7 @@ export default function PatientReferral() {
     reason_for_referral: '',
     clinical_summary: '',
     referring_doctor_name: '',
-    requirements: [],
+    requirements: [] as string[],
   })
 
   const [lat, setLat] = useState('28.6200')
@@ -31,6 +36,17 @@ export default function PatientReferral() {
   const [referral, setReferral] = useState(null)
   const [error, setError] = useState(null)
   const [busy, setBusy] = useState(false)
+
+  async function handleSendRequest(hospitalId: string) {
+    if (!referral) return
+    try {
+      await api.sendReferralRequest(referral.id, hospitalId)
+      const full = await api.getReferral(referral.id)
+      setReferral(full)
+    } catch (err) {
+      console.error(err)
+    }
+  }
 
   function handleFileChange(e) {
     const file = e.target.files?.[0]
@@ -94,6 +110,9 @@ export default function PatientReferral() {
         requirements: form.requirements.map((r) => ({ requirement_type: r, mandatory: true })),
         source_document_note: imageBase64 ? 'Extracted from a scanned referral letter' : undefined,
       })
+      if (result?.journey_id) {
+        setJourneyId(result.journey_id)
+      }
       const full = await api.getReferral(result.referral_id)
       setReferral(full)
     } catch (err) {
@@ -112,18 +131,44 @@ export default function PatientReferral() {
     return () => clearInterval(interval)
   }, [referral])
 
-  if (!patientId) {
-    return <div className="panel">No demo patient selected yet — go to Patient Home first.</div>
-  }
-
   return (
-    <div>
-      <h2>Get a Referral</h2>
-      <p className="subtitle">
-        Bring your own referral — scan a doctor's letter or enter the details yourself, then we search
-        for a hospital that can take your case (requirement: referrals are patient-initiated, not
-        created by hospital staff).
-      </p>
+    <div style={{ padding: '28px 36px 60px', maxWidth: '1000px', margin: '0 auto', width: '100%' }}>
+      {/* Header */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '24px' }}>
+        <div>
+          <div style={{ fontSize: '11px', fontWeight: 800, color: '#9333ea', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+            PATIENT-INITIATED REFERRAL LOOP
+          </div>
+          <h1 style={{ fontSize: '26px', fontWeight: 800, color: '#0f172a', margin: '4px 0 0' }}>
+            Find Higher-tier Hospital
+          </h1>
+          <div style={{ fontSize: '13px', color: '#64748b' }}>
+            Upload or input doctor's treatment notes or transfer advice from your hospital to match advanced tertiary care facilities.
+          </div>
+        </div>
+
+        {/* 108 Emergency Dispatch on top right */}
+        <Link
+          to="/patient/emergency-status"
+          style={{
+            background: 'linear-gradient(135deg, #ef4444 0%, #dc2626 100%)',
+            color: 'white',
+            padding: '10px 20px',
+            borderRadius: '12px',
+            textDecoration: 'none',
+            fontWeight: 800,
+            fontSize: '12px',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '8px',
+            boxShadow: '0 4px 14px rgba(239, 68, 68, 0.35)',
+          }}
+        >
+          <Ambulance size={18} />
+          <span>108 EMERGENCY DISPATCH</span>
+        </Link>
+      </div>
+
 
       {!referral && (
         <>
@@ -197,41 +242,172 @@ export default function PatientReferral() {
       )}
 
       {referral && (
-        <>
-          <div className="panel">
-            <h3>Referral <span className="mono">{referral.id}</span></h3>
-            <p>Status: <span className="badge neutral">{referral.status}</span></p>
-            {referral.status === 'NO_VERIFIED_FEASIBLE_DESTINATION' && (
-              <div className="error-banner">No hospital currently satisfies every mandatory requirement.</div>
-            )}
-          </div>
-
-          <div className="panel">
-            <h3>Ranked hospitals</h3>
-            {referral.evaluations?.filter((e) => e.eligible).length === 0 && (
-              <p className="footnote">No eligible hospitals yet.</p>
-            )}
-            {referral.evaluations
-              ?.filter((e) => e.eligible)
-              .sort((a, b) => (b.score_optional || 0) - (a.score_optional || 0))
-              .map((e, i) => (
-                <div className="list-row" key={e.id}>
-                  <span>#{i + 1} <span className="mono">{e.hospital_id.slice(0, 8)}</span></span>
-                  <span className="mono">score {e.score_optional?.toFixed(3)}</span>
+        <div style={{ marginTop: '24px', display: 'flex', flexDirection: 'column', gap: '20px' }}>
+          <div className="bml-card-panel" style={{ border: '1.5px solid #e0e7ff', background: '#ffffff' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <div>
+                <div style={{ fontSize: '11px', fontWeight: 800, color: '#9333ea', textTransform: 'uppercase' }}>
+                  Referral Active
                 </div>
-              ))}
+                <h3 style={{ fontSize: '18px', fontWeight: 800, color: '#0f172a', margin: '2px 0 0' }}>
+                  {referral.reason_for_referral || 'Specialized Tertiary Care Request'}
+                </h3>
+                <div style={{ fontSize: '12px', color: '#64748b' }}>
+                  Status: <span className="pill-accepted">{(referral.status || 'PENDING').replaceAll('_', ' ')}</span>
+                </div>
+              </div>
+              {referral.journey_id && (
+                <Link
+                  to={`/patient/journey?journey_id=${referral.journey_id}`}
+                  style={{
+                    background: '#9333ea',
+                    color: 'white',
+                    padding: '10px 18px',
+                    borderRadius: '10px',
+                    textDecoration: 'none',
+                    fontWeight: 700,
+                    fontSize: '13px',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '6px',
+                  }}
+                >
+                  <span>Open Live Map</span>
+                  <ArrowRight size={15} />
+                </Link>
+              )}
+            </div>
+            {referral.status === 'NO_VERIFIED_FEASIBLE_DESTINATION' && (
+              <div className="error-banner" style={{ marginTop: '14px' }}>
+                No hospital currently satisfies every mandatory requirement within range.
+              </div>
+            )}
           </div>
 
-          <div className="panel">
-            <h3>Hospital responses</h3>
-            {referral.responses.map((r) => (
-              <div className="list-row" key={r.id}>
-                <span>{r.hospital_name}</span>
-                <span className={`badge ${r.status === 'ACCEPTED' ? 'good' : r.status === 'DECLINED' ? 'bad' : 'pending'}`}>{r.status}</span>
+          {/* Hospital responses */}
+          {referral.responses && referral.responses.length > 0 && (
+            <div className="bml-card-panel" style={{ border: '1.5px solid #a7f3d0', background: '#f0fdf4' }}>
+              <h3 style={{ fontSize: '16px', fontWeight: 800, color: '#065f46', marginBottom: '12px' }}>
+                Hospital Responses
+              </h3>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                {referral.responses.map((r) => {
+                  const isAccepted = r.status === 'ACCEPTED'
+                  return (
+                    <div
+                      key={r.id || r.hospital_id}
+                      style={{
+                        background: '#ffffff',
+                        border: isAccepted ? '1.5px solid #10b981' : '1px solid #e2e8f0',
+                        borderRadius: '10px',
+                        padding: '14px 18px',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                      }}
+                    >
+                      <div>
+                        <div style={{ fontSize: '15px', fontWeight: 800, color: '#0f172a' }}>
+                          {r.hospital_name || 'Network Hospital'}
+                        </div>
+                        <div style={{ fontSize: '12px', color: '#64748b' }}>
+                          {r.response_reason || (isAccepted ? 'Intake slot reserved' : 'Reviewing case')}
+                        </div>
+                      </div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                        <span className={isAccepted ? 'pill-accepted' : 'badge neutral'}>
+                          {r.status}
+                        </span>
+                        {isAccepted && referral.journey_id && (
+                          <Link
+                            to={`/patient/journey?journey_id=${referral.journey_id}`}
+                            style={{
+                              background: '#10b981',
+                              color: 'white',
+                              padding: '8px 14px',
+                              borderRadius: '8px',
+                              textDecoration: 'none',
+                              fontWeight: 700,
+                              fontSize: '12px',
+                            }}
+                          >
+                            Track Route →
+                          </Link>
+                        )}
+                      </div>
+                    </div>
+                  )
+                })}
               </div>
-            ))}
+            </div>
+          )}
+
+          {/* Ranked Hospitals */}
+          <div className="bml-card-panel">
+            <h3 style={{ fontSize: '16px', fontWeight: 800, color: '#0f172a', marginBottom: '14px' }}>
+              Recommended Tertiary Facilities ({referral.evaluations?.filter((e) => e.eligible)?.length || 0} Matched)
+            </h3>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+              {referral.evaluations?.filter((e) => e.eligible).length === 0 && (
+                <div style={{ textAlign: 'center', padding: '24px', color: '#64748b' }}>
+                  No candidate hospitals matching the exact criteria were located.
+                </div>
+              )}
+              {referral.evaluations
+                ?.filter((e) => e.eligible)
+                .sort((a, b) => (b.score_optional || 0) - (a.score_optional || 0))
+                .map((e, i) => {
+                  const isSent = referral.responses?.some((r) => r.hospital_id === e.hospital_id)
+                  return (
+                    <div
+                      key={e.id || e.hospital_id}
+                      style={{
+                        background: '#ffffff',
+                        border: '1px solid #e2e8f0',
+                        borderRadius: '12px',
+                        padding: '16px 20px',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                      }}
+                    >
+                      <div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                          <span style={{ fontSize: '11px', fontWeight: 800, color: '#6366f1', background: '#eef2ff', padding: '2px 8px', borderRadius: '4px' }}>
+                            #{i + 1} MATCH
+                          </span>
+                          <span style={{ fontSize: '15px', fontWeight: 800, color: '#0f172a' }}>
+                            {e.hospital_name || 'Hospital Center'}
+                          </span>
+                        </div>
+                        <div style={{ fontSize: '12px', color: '#64748b', marginTop: '4px' }}>
+                          📍 {e.address || 'Network Hospital'} · {e.score_optional ? `${Math.round(e.score_optional * 100)}% Clinical Match Score` : 'Qualified Facility'}
+                        </div>
+                      </div>
+                      <div>
+                        <button
+                          disabled={isSent || busy}
+                          onClick={() => handleSendRequest(e.hospital_id)}
+                          style={{
+                            background: isSent ? '#f1f5f9' : '#4f46e5',
+                            color: isSent ? '#64748b' : 'white',
+                            border: 'none',
+                            padding: '8px 16px',
+                            borderRadius: '8px',
+                            fontWeight: 700,
+                            fontSize: '12px',
+                            cursor: isSent ? 'default' : 'pointer',
+                          }}
+                        >
+                          {isSent ? 'Request Dispatched' : 'Dispatch Referral'}
+                        </button>
+                      </div>
+                    </div>
+                  )
+                })}
+            </div>
           </div>
-        </>
+        </div>
       )}
     </div>
   )

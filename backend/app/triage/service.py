@@ -17,6 +17,10 @@ def run_assessment(patient_id: str, raw_input: str, presenting_concerns: list[st
 
     with get_cursor(commit=True) as cur:
         cur.execute(
+            "insert into patients (id, display_name) values (%s, 'Patient') on conflict (id) do nothing",
+            (patient_id,),
+        )
+        cur.execute(
             """
             insert into assessments
                 (patient_id, raw_input, triage_label, model_name, model_version,

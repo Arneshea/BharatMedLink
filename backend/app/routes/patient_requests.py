@@ -26,6 +26,9 @@ from app.services.db import get_cursor, get_prototype_config, record_audit_event
 from app.services.routing import get_travel_estimate
 from app.utils.state_machines import assert_journey_transition, assert_stage1_request_transition
 
+from app.referral_engine.ranking import RankingFactors, rank_candidates
+from app.referral_engine.freshness import freshness_score
+
 bp = Blueprint("patient_requests", __name__)
 
 
@@ -51,12 +54,32 @@ def create_patient_request():
     if not all([patient_id, location_lat is not None, location_lon is not None]):
         return jsonify({"error": "patient_id, location_lat, location_lon are required"}), 400
 
-    radius_km = get_prototype_config("candidate_search_radius_km", 25)
-    top_n = get_prototype_config("stage1_broadcast_top_n", 5)
+    radius_km = get_prototype_config("candidate_search_radius_km", 60)
+    top_n = get_prototype_config("stage1_broadcast_top_n", 10)
     response_timeout = get_prototype_config("stage1_response_timeout_seconds", 120)
 
     try:
         with get_cursor(commit=True) as cur:
+            # Auto-supersede any existing pending request so patient is never blocked by ACTIVE_REQUEST_EXISTS
+            cur.execute(
+                """
+                update patient_requests set status = 'CANCELLED'
+                where patient_id = %s and status not in ('MATCHED','NO_MATCH','EXPIRED','CANCELLED','CONFIRMATION_FAILED')
+                returning id
+                """,
+                (patient_id,),
+            )
+            old_req_ids = [r["id"] for r in cur.fetchall()]
+            for oid in old_req_ids:
+                cur.execute(
+                    "update patient_request_responses set status = 'WITHDRAWN' where request_id = %s and status = 'PENDING'",
+                    (oid,),
+                )
+
+            cur.execute(
+                "insert into patients (id, display_name) values (%s, 'Patient') on conflict (id) do nothing",
+                (patient_id,),
+            )
             cur.execute(
                 "insert into journeys (patient_id, current_stage, current_status) "
                 "values (%s, 'STAGE1', 'AT_HOME') returning journey_id",
@@ -64,6 +87,7 @@ def create_patient_request():
             )
             journey_id = cur.fetchone()["journey_id"]
             assert_journey_transition("AT_HOME", "REQUESTING_HOSPITAL")
+
 
             cur.execute(
                 """
@@ -90,25 +114,70 @@ def create_patient_request():
                 (request_id, journey_id),
             )
 
-            cur.execute("select id, name, latitude, longitude from hospitals")
+            cur.execute("select * from hospitals")
             hospitals = cur.fetchall()
 
             mandatory_types = {r["requirement_type"] for r in requirements if r.get("mandatory", True)}
-            candidates = []
+            ranking_inputs = []
+            hospital_by_id = {}
+            routes_by_id = {}
+
             for h in hospitals:
-                if _distance_km(location_lat, location_lon, h["latitude"], h["longitude"]) > radius_km:
+                h_id = h["id"]
+                hospital_by_id[h_id] = h
+                dist = _distance_km(location_lat, location_lon, h["latitude"], h["longitude"])
+                if dist > radius_km:
                     continue
-                cur.execute("select capability from hospital_capabilities where hospital_id = %s", (h["id"],))
+
+                cur.execute("select capability from hospital_capabilities where hospital_id = %s", (h_id,))
                 caps = {r["capability"] for r in cur.fetchall()}
-                if not mandatory_types.issubset(caps):
-                    continue
+
+                # Factor 1: Clinical Fit (35%)
+                if mandatory_types:
+                    matched = len(mandatory_types.intersection(caps))
+                    clinical_fit = 1.0 if mandatory_types.issubset(caps) else max(0.4, matched / len(mandatory_types))
+                else:
+                    clinical_fit = 1.0 if caps else 0.8
+
+                # Factor 2: Travel ETA (25%)
                 route = get_travel_estimate(location_lat, location_lon, h["latitude"], h["longitude"])
-                candidates.append((h, route))
+                routes_by_id[h_id] = route
 
-            candidates.sort(key=lambda c: (c[1].travel_seconds is None, c[1].travel_seconds or 0))
-            broadcast_set = candidates[:top_n]
+                # Factor 3: Capacity (15%)
+                tot_beds = h.get("bed_capacity_total") or 100
+                occ_beds = h.get("bed_capacity_occupied") or 60
+                capacity_headroom = max(0.05, min(1.0, (tot_beds - occ_beds) / max(tot_beds, 1)))
 
-            for h, route in broadcast_set:
+                # Factor 4: Specialist Coverage (12%)
+                spec_coverage = 0.95 if h.get("on_call_specialists") else 0.80
+
+                # Factor 5: Historical Reliability (8%)
+                reliability = 0.95 if h.get("is_verified") else 0.85
+
+                # Factor 6: Data Freshness (5%)
+                freshness = freshness_score(h.get("updated_at"))
+
+                rf = RankingFactors(
+                    hospital_id=h_id,
+                    travel_seconds=route.travel_seconds,
+                    clinical_fit=clinical_fit,
+                    capacity=capacity_headroom,
+                    specialist_coverage=spec_coverage,
+                    historical_reliability=reliability,
+                    data_freshness=freshness,
+                    routing_source=route.source,
+                )
+                ranking_inputs.append(rf)
+
+            # Sort candidate hospitals using 6-criteria ranking
+            ranked = rank_candidates(ranking_inputs)
+            top_ranked = ranked[:top_n]
+
+            broadcast_set = []
+            for rc in top_ranked:
+                h = hospital_by_id[rc.hospital_id]
+                route = routes_by_id[rc.hospital_id]
+                broadcast_set.append((h, route))
                 cur.execute(
                     """
                     insert into patient_request_responses
@@ -144,6 +213,7 @@ def create_patient_request():
         "broadcast_hospitals": [h["id"] for h, _ in broadcast_set],
         "created_at": req_row["created_at"].isoformat(),
     }), 201
+
 
 
 @bp.get("/patient-requests/<request_id>")
@@ -186,9 +256,14 @@ def list_hospital_request_responses(hospital_id):
     with get_cursor() as cur:
         cur.execute(
             """
-            select prr.*, pr.symptom_summary, pr.urgency, pr.status as request_status, pr.location_lat, pr.location_lon
+            select prr.*, pr.symptom_summary, pr.urgency, pr.status as request_status, pr.location_lat, pr.location_lon,
+                   pr.patient_id, p.display_name as patient_name, p.age as patient_age, p.sex as patient_sex,
+                   p.blood_group, p.allergies, p.medical_history, p.current_medications, p.previous_surgeries,
+                   p.emergency_contact_name, p.emergency_contact_phone, u.details as user_details
             from patient_request_responses prr
             join patient_requests pr on pr.id = prr.request_id
+            left join patients p on p.id = pr.patient_id
+            left join user_accounts u on u.id = pr.patient_id
             where prr.hospital_id = %s
             order by prr.created_at desc
             limit 50
@@ -211,6 +286,7 @@ def list_hospital_request_responses(hospital_id):
             d["location_lon"] = None
         result.append(d)
     return jsonify(result), 200
+
 
 
 @bp.post("/patient-request-responses/<response_id>/accept")
@@ -265,14 +341,56 @@ def select_hospital(request_id):
         return jsonify({"error": "hospital_id is required"}), 400
 
     with get_cursor(commit=True) as cur:
-        cur.execute("select select_hospital_for_request(%s, %s) as ok", (request_id, hospital_id))
-        ok = cur.fetchone()["ok"]
+        # Check if response exists and was accepted
+        cur.execute(
+            "select 1 from patient_request_responses where request_id = %s and hospital_id = %s and status = 'ACCEPTED'",
+            (request_id, hospital_id),
+        )
+        if not cur.fetchone():
+            return jsonify({"error": "SELECTION_FAILED", "detail": "Hospital has not accepted this request"}), 409
 
-    if not ok:
-        return jsonify({"error": "SELECTION_FAILED", "detail": "Request not in PATIENT_SELECTING or hospital not ACCEPTED"}), 409
+        # Mark request as MATCHED directly
+        cur.execute(
+            """
+            update patient_requests
+            set status = 'MATCHED',
+                selected_hospital_id_optional = %s,
+                version = version + 1
+            where id = %s
+            returning journey_id
+            """,
+            (hospital_id, request_id),
+        )
+        req_row = cur.fetchone()
+        journey_id = req_row["journey_id"] if req_row else None
+
+        # Update journey stage1_hospital_id and current_status
+        if journey_id:
+            cur.execute(
+                """
+                update journeys
+                set current_status = 'MATCHED_TO_HOSPITAL_1',
+                    stage1_hospital_id = %s
+                where journey_id = %s
+                """,
+                (hospital_id, journey_id),
+            )
+        else:
+            cur.execute(
+                """
+                update journeys
+                set current_status = 'MATCHED_TO_HOSPITAL_1',
+                    stage1_hospital_id = %s
+                where stage1_request_id = %s
+                returning journey_id
+                """,
+                (hospital_id, request_id),
+            )
+            j_row = cur.fetchone()
+            journey_id = j_row["journey_id"] if j_row else None
 
     record_audit_event(None, "PATIENT", "PATIENT_SELECTED_HOSPITAL", "patient_request", request_id, {"hospital_id": hospital_id})
-    return jsonify({"status": "CONFIRMING"}), 200
+    return jsonify({"status": "MATCHED", "journey_id": journey_id}), 200
 
 
 @bp.post("/patient-request-responses/<response_id>/confirm")

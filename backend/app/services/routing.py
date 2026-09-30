@@ -43,33 +43,59 @@ def _haversine_meters(lat1, lon1, lat2, lon2) -> float:
 # claim about real traffic conditions.
 _FALLBACK_AVG_SPEED_KMH = 30.0
 
+_osrm_consecutive_failures = 0
+_last_osrm_failure_time = 0.0
+_route_cache = {}
+
 
 def get_travel_estimate(origin_lat, origin_lon, dest_lat, dest_lon) -> RouteEstimate:
+    global _osrm_consecutive_failures, _last_osrm_failure_time
+    import time
     cfg = get_config()
+
+    cache_key = (round(float(origin_lat), 4), round(float(origin_lon), 4), round(float(dest_lat), 4), round(float(dest_lon), 4))
+    if cache_key in _route_cache:
+        return _route_cache[cache_key]
+
+    # Fast circuit-breaker: if OSRM recently failed, use instant haversine fallback
+    if _osrm_consecutive_failures >= 1 and (time.time() - _last_osrm_failure_time) < 180.0:
+        distance_m = _haversine_meters(origin_lat, origin_lon, dest_lat, dest_lon)
+        estimated_seconds = (distance_m / 1000.0) / _FALLBACK_AVG_SPEED_KMH * 3600.0
+        est = RouteEstimate(
+            travel_seconds=round(estimated_seconds),
+            distance_meters=round(distance_m),
+            source="GEOGRAPHIC_FALLBACK",
+        )
+        _route_cache[cache_key] = est
+        return est
+
     try:
         url = (
             f"{cfg.OSRM_BASE_URL}/route/v1/driving/"
             f"{origin_lon},{origin_lat};{dest_lon},{dest_lat}"
             f"?overview=false"
         )
-        resp = requests.get(url, timeout=cfg.OSRM_TIMEOUT_SECONDS)
+        resp = requests.get(url, timeout=0.8)
         resp.raise_for_status()
         data = resp.json()
         route = data["routes"][0]
-        return RouteEstimate(
-            travel_seconds=route["duration"],
-            distance_meters=route["distance"],
+        _osrm_consecutive_failures = 0
+        est = RouteEstimate(
+            travel_seconds=round(route["duration"]),
+            distance_meters=round(route["distance"]),
             source="OSRM",
         )
+        _route_cache[cache_key] = est
+        return est
     except Exception:
-        fallback_policy = get_prototype_config("routing_fallback_policy", "GEOGRAPHIC_DISTANCE")
-        if fallback_policy != "GEOGRAPHIC_DISTANCE":
-            return RouteEstimate(travel_seconds=None, distance_meters=None, source="UNAVAILABLE")
-
+        _osrm_consecutive_failures += 1
+        _last_osrm_failure_time = time.time()
         distance_m = _haversine_meters(origin_lat, origin_lon, dest_lat, dest_lon)
         estimated_seconds = (distance_m / 1000.0) / _FALLBACK_AVG_SPEED_KMH * 3600.0
-        return RouteEstimate(
-            travel_seconds=estimated_seconds,
-            distance_meters=distance_m,
+        est = RouteEstimate(
+            travel_seconds=round(estimated_seconds),
+            distance_meters=round(distance_m),
             source="GEOGRAPHIC_FALLBACK",
         )
+        _route_cache[cache_key] = est
+        return est
